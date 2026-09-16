@@ -65,7 +65,8 @@ class DynamicTorchDataset(ABC):
             max_img_per_gpu=max_img_per_gpu,
             temporal_multiplier=(
                 int(getattr(common_config, "temporal_clip_length", 1))
-                if bool(getattr(common_config, "use_temporal_training", False))
+                if (bool(getattr(common_config, "use_temporal_training", False))
+                    and not bool(getattr(common_config, "gt_body_history", False)))
                 else 1
             ),
         )

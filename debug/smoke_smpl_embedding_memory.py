@@ -56,6 +56,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with initialize_config_dir(version_base=None, config_dir=str(REPO / "training/config")):
         cfg = compose(config_name=args.config)
+    if cfg.model.get("temporal_mode") == "gt_body_parameters":
+        parser.error("This config now uses GT body parameters. Run debug/smoke_gt_body_history.py instead.")
     with open_dict(cfg):
         cfg.mamma_compose_root = str((args.compose_root / args.sequence).resolve())
         cfg.val_sequence_fraction = 0.0

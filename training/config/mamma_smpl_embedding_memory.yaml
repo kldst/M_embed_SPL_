@@ -1,14 +1,14 @@
-# Causal current-image + two-frame spatial SMPL embedding memory.
+# Current images + two frames of GT SMPL-X BODY parameters (no past RGB).
 # Inherits the existing 518px / eight-view / SMPL-X / DPT loss setup.
 defaults:
   - mamma_harmony4d_mask_dpt
   - _self_
 
-exp_name: mamma_smpl_embedding_memory_2frame
+exp_name: mamma_harmony4d_gt_body_parameter_history
 mamma_compose_root: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/mamma_compose
 harmony4d_compose_root: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/mamma_harmony4d_compose
-# Each sample contains T*V=24 images. A budget of 120 therefore requests B=5.
-max_img_per_gpu: 120
+# Each sample now loads only V=8 current images. 40 keeps the previous B=5.
+max_img_per_gpu: 40
 
 temporal_training:
   clip_length: 3
@@ -18,6 +18,7 @@ data:
   train:
     common_config:
       max_img_per_gpu: ${max_img_per_gpu}
+      gt_body_history: true
     dataset:
       dataset_configs:
         - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
@@ -57,6 +58,8 @@ data:
           max_sequences: ${debug_max_sequences}
           max_frames_per_sequence: ${debug_max_frames_per_sequence}
   val:
+    common_config:
+      gt_body_history: true
     dataset:
       dataset_configs:
         - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
@@ -78,20 +81,24 @@ data:
           max_frames_per_sequence: ${debug_val_max_frames_per_sequence}
 
 model:
-  temporal_mode: smpl_embedding_memory
+  temporal_mode: gt_body_parameters
+  body_history_parameter_dim: 256
+  body_history_parameter_depth: 1
   temporal_memory_depth: 2
-  temporal_detach_history: true
   temporal_memory_dropout: 0.1
-  temporal_memory_presence_threshold: 0.3
-  # Translation distances are in the common cam0 gauge, without baseline scaling.
-  temporal_memory_match_max_distance: 2.0
-  temporal_memory_match_max_cost: 1.5
-  temporal_memory_match_translation_weight: 0.25
 
 loss:
-  _target_: training.loss_smpl_embedding_memory.SMPLEmbeddingMemoryLoss
+  _target_: training.loss_gt_body_history.SMPLGTBodyHistoryLoss
   smplx_model_dir: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/smplx_models
   spatial_aux_weight: 0.25
+  smpl:
+    # Dataset still samples three timestamps, but only the last is predicted.
+    use_temporal_training: false
+    joints2d_use_exact_gt_intrinsics: true
+    weight_temporal_pose: 0.0
+    weight_temporal_beta: 0.0
+    weight_temporal_mesh_translate: 0.0
+    weight_temporal_root_rotation: 0.0
 
 checkpoint:
   resume_checkpoint_path: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/model/checkpoint_30.pt
@@ -109,10 +116,10 @@ logging:
         - loss_camera
         - loss_smpl
         - loss_smpl_spatial_aux
-        - loss_smpl_temporal_pose
-        - loss_smpl_temporal_beta
-        - loss_smpl_temporal_mesh_translate
-        - loss_smpl_temporal_root_rotation
+        - loss_smpl_joints2d
+        - loss_smpl_joints3d
+        - loss_smpl_vertices
+        - loss_mesh_translate
         - loss_mask
         - mask_soft_iou
         - smpl_memory_valid_fraction

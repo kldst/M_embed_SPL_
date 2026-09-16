@@ -1016,6 +1016,11 @@ def compute_smpl_loss(
                 pose_encoding_type=pose_encoding_type,
                 build_intrinsics=True,
             )
+            if kwargs.get("joints2d_use_exact_gt_intrinsics", False) and (use_gt or joints2d_use_gt_camera):
+                # FoV camera encoding fixes principal point at image center and
+                # cannot round-trip an arbitrary cropped/resized GT calibration.
+                pred_extr = batch["extrinsics"].float()
+                pred_intr = batch["intrinsics"].float()
 
         B, S = pred_pose_enc.shape[:2]
         if pred_joints_norm.dim() == 4:

@@ -45,6 +45,7 @@ from train_utils.normalization import (
 )
 from train_utils.optimizer import construct_optimizers
 from training.temporal import flatten_temporal_batch_for_framewise_model
+from training.gt_body_history import prepare_gt_body_history
 
 
 NORMALIZE_CAM = False
@@ -983,6 +984,10 @@ class Trainer:
             batch["avg_scale"] = torch.ones(B, device=device)
             batch["raw_extrinsics"] = batch["extrinsics"].clone()
 
+        if bool(getattr(self.data_conf.train.common_config, "gt_body_history", False)):
+            if not self.normalize_cam:
+                raise ValueError("GT body history requires normalize_cam=True")
+            batch.update(prepare_gt_body_history(batch))
         return batch
 
     def _step(self, batch, model: nn.Module, phase: str, loss_meters: dict):
@@ -1009,6 +1014,8 @@ class Trainer:
         for key in (
             "views_per_frame", "temporal_num_frames", "num_groups",
             "frame_ids", "view_ids",
+            "history_body_pose", "history_body_beta", "history_root_position",
+            "history_valid", "history_frame_ids",
         ):
             if key in batch:
                 smpl_inputs[key] = batch[key]

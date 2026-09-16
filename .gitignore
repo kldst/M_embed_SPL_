@@ -106,6 +106,7 @@ Thumbs.db
 !/debug/debug_compose_mamma_518.py
 !/debug/validate_training_compose_datasets.py
 !/debug/smoke_smpl_embedding_memory.py
+!/debug/smoke_gt_body_history.py
 !/debug/temporal_alignment/
 !/debug/temporal_alignment/**
 /debug/temporal_alignment/outputs/

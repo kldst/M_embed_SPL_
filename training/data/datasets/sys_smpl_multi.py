@@ -102,6 +102,7 @@ class SysSMPLMultiDataset(BaseDataset):
         self.use_temporal_training = bool(
             getattr(common_conf, "use_temporal_training", False)
         )
+        self.gt_body_history = bool(getattr(common_conf, "gt_body_history", False))
         self.temporal_clip_length = int(
             getattr(common_conf, "temporal_clip_length", 3)
         )
@@ -112,6 +113,8 @@ class SysSMPLMultiDataset(BaseDataset):
             raise ValueError("temporal_clip_length must be >= 2")
         if self.temporal_clip_stride < 1:
             raise ValueError("temporal_clip_stride must be >= 1")
+        if self.gt_body_history and (not self.use_temporal_training or self.temporal_clip_length != 3):
+            raise ValueError("gt_body_history requires temporal training with clip_length=3")
 
         if SysSMPL_DIR is None or SysSMPL_ANNOTATION_DIR is None:
             raise ValueError("SysSMPL_DIR and SysSMPL_ANNOTATION_DIR must be specified.")
@@ -337,6 +340,8 @@ class SysSMPLMultiDataset(BaseDataset):
             np.asarray(person["smpl_pose"], dtype=np.float32).reshape(-1)[:72]
             for person in people
         ]))
+        if self.gt_body_history:
+            pose_t[:, 66:] = 0  # SMPL-X root + 21 body joints; no jaw/eyes/hands.
         beta_t = torch.as_tensor(np.stack([
             np.asarray(person["smpl_beta"], dtype=np.float32).reshape(-1)[:10]
             for person in people
@@ -912,6 +917,10 @@ class SysSMPLMultiDataset(BaseDataset):
             order = np.random.permutation(len(common_views))[:requested]
             selected_view_names = [common_views[int(i)] for i in order]
 
+        if self.gt_body_history:
+            return self._get_gt_body_history_data(clip, requested, aspect_ratio,
+                                                  selected_view_names, _resample_depth)
+
         frame_batches = []
         for frame_key in clip["frame_keys"]:
             frame_batch = self._get_single_frame_data(
@@ -940,6 +949,52 @@ class SysSMPLMultiDataset(BaseDataset):
             timings["dataset_total"] += time.perf_counter() - total_start
             batch["_profile_timings"] = dict(timings)
         return batch
+
+    def _get_gt_body_history_data(self, clip, requested, aspect_ratio, views, depth):
+        """Only the target frame reads images; history comes from annotation metadata.
+
+        History IDs are the union of the TWO PAST frames only. Current labels
+        neither order nor select the history passed to the model.
+        """
+        current = self._get_single_frame_data(
+            seq_name=clip["frame_keys"][-1], img_per_seq=requested,
+            aspect_ratio=aspect_ratio, required_view_names=views,
+        )
+        if current is None:
+            return self._resample_temporal_clip(requested, aspect_ratio, depth,
+                                                reason="unreadable current view")
+        past = [self.frame_data_store[key][0]["people"] for key in clip["frame_keys"][:2]]
+        for people in past:
+            if any("person_key" not in person for person in people):
+                raise ValueError("GT parameter history requires explicit person_key identities")
+        keys = sorted({person["person_key"] for people in past for person in people})[:self.max_num_people]
+        index = {key: i for i, key in enumerate(keys)}
+        P = self.max_num_people
+        pose = np.zeros((2, P, 72), np.float32)
+        beta = np.zeros((2, P, 10), np.float32)
+        trans = np.zeros((2, P, 3), np.float32)
+        gender = np.full((2, P), 2, np.int64)
+        valid = np.zeros((2, P), np.float32)
+        for t, people in enumerate(past):
+            for person in people:
+                p = index.get(person["person_key"])
+                if p is None:
+                    continue
+                pose[t, p, :66] = np.asarray(person["smpl_pose"]).reshape(-1)[:66]
+                beta[t, p] = np.asarray(person["smpl_beta"]).reshape(-1)[:10]
+                trans[t, p] = np.asarray(person["smpl_trans"]).reshape(3)
+                gender[t, p] = self._parse_gender_label(person.get("gender", "neutral"))
+                valid[t, p] = 1
+        current.update(
+            history_smpl_pose=pose, history_smpl_beta=beta, history_smpl_trans=trans,
+            history_smpl_gender=gender, history_valid=valid,
+            history_frame_ids=np.asarray(clip["frame_ids"][:2], dtype=np.int64),
+            frame_ids=np.asarray(clip["frame_ids"][-1:], dtype=np.int64),
+            temporal_num_frames=1, views_per_frame=requested,
+            view_ids=np.arange(requested, dtype=np.int64),
+        )
+        current["smpl_pose"][..., 66:] = 0
+        return current
 
     def _resample_temporal_clip(self, img_per_seq, aspect_ratio, depth, reason):
         if depth < 20 and self.sequence_list_len > 1:
@@ -1331,6 +1386,15 @@ class SysSMPLMultiDataset(BaseDataset):
             preprocess_elapsed += time.perf_counter() - preprocess_start
             H_final, W_final = image.shape[:2]
             joints2d_new = track_new[:n_joint_pts].reshape(padded_people, 24, 2)
+            if self.gt_body_history:
+                # Legacy track resize omits K's half-pixel correction. Body GT
+                # supervision uses the final camera's pixel-center convention.
+                joints2d_new = self._project_points_opencv_np(
+                    joints3d_world.reshape(-1, 3), extri_opencv, intri_opencv,
+                ).reshape(padded_people, 24, 2)
+                xy = joints2d_new.reshape(-1, 2)
+                confidence[:n_joint_pts] = ((xy[:, 0] >= 0) & (xy[:, 0] < W_final)
+                    & (xy[:, 1] >= 0) & (xy[:, 1] < H_final)).astype(np.float32)
             if confidence is not None:
                 joints_conf = confidence[:n_joint_pts].reshape(padded_people, 24)
                 # process_one_image's confidence is only an IN-FRAME test, so a person

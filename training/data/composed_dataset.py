@@ -209,6 +209,12 @@ class ComposedDataset(Dataset, ABC):
         if "temporal_num_frames" in batch:
             sample["temporal_num_frames"] = torch.as_tensor(batch["temporal_num_frames"], dtype=torch.long)
 
+        for key in ("history_smpl_pose", "history_smpl_beta", "history_smpl_trans",
+                    "history_valid", "history_smpl_gender", "history_frame_ids"):
+            if key in batch:
+                dtype = torch.long if key in ("history_frame_ids", "history_smpl_gender") else torch.float32
+                sample[key] = torch.as_tensor(np.asarray(batch[key]), dtype=dtype)
+
         if "frame_ids" in batch:
             sample["frame_ids"] = torch.from_numpy(
                 np.asarray(batch["frame_ids"]).astype(np.int64)

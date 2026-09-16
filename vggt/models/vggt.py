@@ -16,6 +16,7 @@ from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
 from vggt.heads.smpl_head import SMPLHead
 from vggt.heads.smpl_embedding_memory_head import SMPLEmbeddingMemoryHead
+from vggt.heads.smpl_gt_body_history_head import SMPLGTBodyHistoryHead
 from vggt.heads.smpl_multi_query_head import SMPLMultiQueryHead
 from vggt.heads.smpl_multi_query_trans_head import SMPLMultiQueryTransHead
 from vggt.heads.smpl_multi_query_trans_rot_head import SMPLMultiQueryTransRotHead
@@ -44,6 +45,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  temporal_memory_match_max_distance=2.0,
                  temporal_memory_match_max_cost=1.5,
                  temporal_memory_match_translation_weight=0.25,
+                 body_history_parameter_dim=256, body_history_parameter_depth=1,
                  enable_smpl_dense_landmark=False, enable_person_mask=False,
                  person_mask_head_type="dot", person_mask_down_ratio=2,
                  person_mask_embed_dim=None,
@@ -52,10 +54,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  ):
         super().__init__()
 
-        if temporal_mode not in ("relative_image_context", "smpl_embedding_memory"):
+        if temporal_mode not in ("relative_image_context", "smpl_embedding_memory", "gt_body_parameters"):
             raise ValueError(f"Unknown temporal_mode: {temporal_mode}")
-        if temporal_mode == "smpl_embedding_memory" and not enable_temporal_heads:
-            raise ValueError("smpl_embedding_memory requires enable_temporal_heads=True")
+        if temporal_mode in ("smpl_embedding_memory", "gt_body_parameters") and not enable_temporal_heads:
+            raise ValueError(f"{temporal_mode} requires enable_temporal_heads=True")
 
         if enable_temporal_heads and not enable_smpl_multi_query_trans_rot:
             raise ValueError(
@@ -102,6 +104,14 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     match_max_distance=temporal_memory_match_max_distance,
                     match_max_cost=temporal_memory_match_max_cost,
                     match_translation_weight=temporal_memory_match_translation_weight,
+                )
+            elif temporal_mode == "gt_body_parameters":
+                head_class = SMPLGTBodyHistoryHead
+                memory_kwargs = dict(
+                    parameter_dim=body_history_parameter_dim,
+                    parameter_depth=body_history_parameter_depth,
+                    memory_depth=temporal_memory_depth,
+                    history_dropout=temporal_memory_dropout,
                 )
             self.smpl_multi_query_trans_rot_head = (
                 head_class(

@@ -1,160 +1,152 @@
-# 兩幀 SMPL Embedding Memory
+# 當前影像 + 前兩幀 GT SMPL-X 身體參數
 
-## 任務與架構
-
-使用當前多視角影像，以及前兩幀獨立生成的每人 SMPL embedding，輸出當前 SMPL。
-`training/config/mamma_smpl_embedding_memory.yaml` 繼承原本混合資料 config 的模型尺寸與
-SMPL-X / camera / DPT mask / temporal motion loss 設定；資料來源改為本機 `mamma_compose`，
-train/val 以 sequence 分割。原 config 的行為不變。
+`training/config/mamma_smpl_embedding_memory.yaml` 現在使用 `gt_body_parameters` 架構。
+每個 sample 只有當前 frame 的 8-view RGB；前兩幀直接讀取 compose manifest 的
+GT pose、beta、translation、gender、人物身分與有效性，不讀取它們的 RGB 或 mask。
+訓練來源仍是 MAMMA + Harmony4D；validation 是 Harmony4D 的 10% sequence split。
 
 ```mermaid
 flowchart TD
-    I["當前 8-view RGB I_t"] --> A["VGGT Aggregator：單一時間的多視角融合"]
-    A --> F["Image tokens：B × 10952 × 2048"]
-    Q["20 個人物 queries：1024 維"] --> S
-    F --> S["Spatial SMPL Decoder：6 層，T=1"]
-    S --> E["SMPL Embedding E_t：B × 20 × 1024"]
-    E --> C["Coarse pose / beta / translation / presence"]
-    E --> M["人物對應：cosine distance + translation distance"]
-    C --> M
-    H["快取 E_(t-1)、E_(t-2) 與 coarse 預測、frame IDs"] --> M
-    M --> K["對齊後兩幀 embedding + lag embedding + validity mask"]
-    E --> T["Temporal Cross-Attention：Q=當前、K/V=歷史"]
-    K --> T
-    T --> G["Gate + Residual + FFN，共 2 層"]
-    E --> G
-    G --> R["融合 token H_t"]
-    R --> O["共享 SMPL Heads：pose72 / beta10 / translation3 / presence1"]
-    R --> D["DPT Person Mask Head"]
-    A --> D
-    A --> CAM["Camera Head"]
-    E --> NEXT["存入下一幀 memory；只保留 E，最多兩幀"]
+    GT["前兩幀 GT：body pose / beta / translation"] --> ALIGN["只根據兩幀歷史 ID 對齊人物"]
+    ALIGN --> GAUGE["World → 當前 cam0 gauge<br/>shape-dependent pelvis offset"]
+    GAUGE --> ENC["Body Parameter Encoder<br/>root + 21 body joints → rotation6D → MLP<br/>beta10 / pelvis3 → 獨立投影"]
+    ENC --> JOINT["24 tokens / 人 / 幀<br/>22 rotations + shape + position<br/>Joint Transformer，256 維"]
+    JOINT --> TIME["加入 lag 1/2 embedding<br/>每人 48 tokens 的 Temporal Transformer"]
+    TIME --> MEMORY["兩幀歷史參數 tokens + validity mask"]
+    IMG["當前 8-view RGB"] --> VGGT["Frozen VGGT Aggregator"]
+    VGGT --> SP["單幀 Spatial Person Decoder，T=1"]
+    SP --> Q["20 個人物 queries，1024 維"]
+    Q --> AUX["Coarse SMPL-X heads + auxiliary loss"]
+    Q --> CA["Cross-attention：Q=當前人物，K/V=歷史參數"]
+    MEMORY --> CA
+    CA --> G["Gate + Residual + FFN，共 2 層"]
+    Q --> G
+    G --> FINAL["共享 heads → 當前 body pose / beta / pelvis / presence"]
+    G --> MASK["DPT person mask"]
+    VGGT --> MASK
+    VGGT --> CAM["Camera head"]
 ```
 
-518 / 14 = 37，所以每個視角有 1369 個 patch，八視角共 10952 個。
-SMPL embedding 是參數回歸前的 `person_tokens`；不是 mask head 的 128 維投影，
-也不是將已預測的 SMPL 參數重新編碼。
+## 身體範圍與座標
 
-## 模組設計原因
+- 僅編碼 root + 21 個 SMPL-X body joints，共 66 個 axis-angle 數值；轉成 22 × 6
+  的 rotation6D 表示。手指、下顎、眼球都沒有 encoder 分支。
+- 為沿用 checkpoint 和 loss，輸出保留 `smpl_pose[...,72]`，尾端 6 維固定為零，
+  不訓練它們；其他 SMPL-X hand/jaw/eye pose 在 body decoder 保持零。
+- beta 使用現有 10 維。translation token 是當前 cam0 座標下的 pelvis 位置，
+  不是直接拿 world-space `smpl_trans`。`prepare_gt_body_history` 先用身體模型取得
+  shape-dependent pelvis offset，再轉換 root rotation、pelvis position。
+- 前兩幀都使用當前第一台相機的外參與同一個 `avg_scale`，避免逐幀 gauge 不一致。
+  本 config 使用 `normalize_cam: true`、`scale_by_extrinsics: false`。
+- `gender` 只供 GT pelvis/body 幾何轉換，沒有作為 encoder token。
 
-| 模組 | 設計原因 |
+## 設計原因
+
+| 模組 | 原因 |
 | --- | --- |
-| Frozen VGGT Aggregator | 保留既有多視角觀測能力；先訓練 SMPL、memory、camera 與 mask heads。時間始終折進 batch，aggregator 不跨時間。 |
-| Spatial decoder | 沿用原 relative temporal decoder 的參數名稱與尺寸，但每次只解碼 T=1。所有空間 embedding 都不含其他時間的影像，能安全快取。原 decoder 的六層 singleton self-attention / zero-offset relative bias 保留以載入 checkpoint。 |
-| 預測式人物對應 | 對每個 history frame 做一對一 Hungarian 配對，cost 是 embedding cosine distance + 0.25 × translation distance。人物存在信心、最大距離與最大 cost 排除不可信歷史，dummy columns 允許 unmatched。不能假設相同 query index 就是同一個人。 |
-| 時間編碼與 validity | 兩個 learned lag embeddings 分別代表相差 1、2 個 frame。無效人物、超過兩幀、缺幀不會假裝有歷史。訓練另有 0.1 history dropout，模擬漏檢。此版本使用 frame index，要求固定 FPS；混合 FPS 時需先重採樣或擴充成時間戳編碼。 |
-| Temporal attention | 每人只讀取對應的兩個歷史 token，避免重新保留歷史的全圖 patch tokens。兩層 attention 是初始設計，改善效果須靠 ablation 評估。 |
-| Gate + residual | gate 接收當前 token、attention 結果與兩個有效 presence 分數，初始 bias=-2。歷史為空時整個 layer 精確回退 spatial token，null key 防止全遮罩 attention 的 NaN。presence 只是存在信心，不等同姿態品質。 |
-| Shared SMPL heads | spatial E 與 refined H 透過相同輸出層接受監督，讓 E 可解碼人體資訊；輸出介面與舊 loss 一致。 |
-| DPT mask / camera | H 與當前多尺度視覺特徵產生人物 mask；camera 由當前影像決定。保留原本的幾何與分割監督。 |
+| 各關節 MLP + part embedding | 區分關節，保留局部姿態；root、shape、位置用不同投影反映不同物理意義。 |
+| Joint Transformer | 學習同一時間的關節關係，不在最初就壓成一個全身向量。 |
+| Lag embedding + Temporal Transformer | 對同一個人的兩幀 tokens 學習先後與動作；不使用當前 GT。第一版使用 frame index，未編碼來源 FPS；混合 FPS 的動作時間尺度需另行校正。 |
+| 全歷史 cross-attention | 當前 learned queries 不等於 GT person ID，讓模型根據當前影像和 SMPL/mask 監督學習從歷史集合檢索。歷史人物排列不影響輸出；沒有輸入當前 GT 身分的硬配對。 |
+| Gate / residual | 控制歷史修正強度，gate bias 初始化 -2；兩幀都無效時精確回退 coarse 分支。歷史 dropout=0.1 模擬缺失。 |
+| Null token + validity mask | 防止人物缺失時全遮罩 attention 產生 NaN；無效 padded 參數在數值運算前清零。 |
+| 共享參數 heads + coarse auxiliary loss | 保留單幀辨識能力並 warm-start 原 checkpoint；coarse/refined 都由當前 GT 監督。 |
 
-人物對應是 memory retrieval，不是完整長時間 tracker：兩個歷史 frame 分別對應當前
-frame，沒有永久 track ID，也不會保留超過兩幀的遮擋人物。訓練與推論皆只使用預測
-資訊做 memory matching，沒有輸入 GT 身分或 GT pose 的 train/inference 落差。
-若模型初期 coarse predictions 很差，valid history 可能偏少；請監看
-`smpl_memory_valid_fraction`，並以 pretrained checkpoint 起訓。
+模型沒有讀取過去影像，也沒有讀取當前 GT pose/beta/位置/身分。資料載入器的歷史
+person slots 只由前兩幀 ID 的 union 決定；不根據當前人物標籤選取歷史。
+每個歷史 frame 都必須比 target 早；超過兩幀的歷史會被遮罩。
 
-## Loss
+## Loss 與重投影
 
-```text
-L_total = L_refined_multitask + 0.25 * L_spatial_SMPL
-```
+`L = L_current_multitask + 0.25 × L_current_coarse_SMPL`。
 
-- `L_refined_multitask`：沿用原有 camera、SMPL pose、beta、joints2d、joints3d、vertices、
-  mesh translation、presence、DPT mask loss，及 GT-relative temporal motion loss。
-- `L_spatial_SMPL`：對每一幀 E 的 coarse predictions 使用原有 SMPL 幾何與 presence
-  監督（同組權重），不重複加 camera、mask 或 temporal loss。Spatial Hungarian
-  matching 使用 pose / beta / translation / presence，不使用不存在的 coarse mask。
-- Temporal pose 權重 0.05：比較預測和 GT 的局部關節相對 SO(3) 運動。
-- Temporal root 權重 0.02：比較 root 的相對 SO(3) 運動。
-- Temporal translation 權重 0.05：比較預測位移和 GT 位移。
-- Temporal beta 權重 0.01：同一人物體型的一階一致性。
-- GT matching 只在 loss 中使用。既有 loss 先把各幀預測對齊 dataset 的人物順序，再算 motion；
-  人物缺失會由 `has_smpl` 遮罩排除。
+沿用 pose、beta、mesh translation、presence、joints2d、joints3d、vertices、DPT mask、
+camera 的現有權重。Coarse 分支沒有 mask，只算幾何/presence，不重複算 camera。
+參數 encoder 直接從當前 SMPL/geometry/mask loss 端到端訓練，沒有額外 reconstruction loss。
 
-訓練回傳 `[B*T,P,...]`，各幀依序使用 0、1、2 幀歷史，各 causal prediction 都有監督，
-不是只監督最後一幀。推論取當前輸出即可。clip 長度 3、stride 1；shuffle 只打亂完整
-clip，不會讓不同 batch 共享狀態。`temporal_detach_history: true` 切斷歷史 token 的
-refinement 梯度，但 spatial auxiliary loss 仍會訓練其 encoder；設為 false 可做 clip 內
-端到端反傳。沒有將 fused H 寫回 memory，因此特徵的時間範圍確實限於兩幀。
+這個模型只預測當前一幀，所以 `loss.smpl.use_temporal_training: false`。Loader 的
+`temporal_training.enabled: true` 仍用於取三個連續時間點，和 loss 的開關意義不同。
+原本 pose/root/translation/beta temporal loss 權重設為 0。若歷史是精確 GT，
+`(pred_t - GT_(t-1)) - (GT_t - GT_(t-1)) = pred_t - GT_t`，重複加入不提供新的時間資訊；
+SO(3) 的相對旋轉 geodesic 誤差亦有相同的旋轉不變性。
 
-## 訓練
+重投影採一致的 pixel-center 定義：新模式直接以最終內參投影 GT 身體 joints，
+避免 legacy track resize 的固定次像素偏移。`joints2d_use_exact_gt_intrinsics: true`
+讓 GT-camera joints2d loss 直接使用完整 K/E，不經只保留 FoV 的相機編碼來回轉換，
+以保留裁切後的主點。舊 config 預設維持原本的 loss 行為。
 
-在 repo root 使用原訓練入口：
+## 訓練與推論
 
 ```bash
+cd /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/M_embed_SPL_
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=.:training \
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 /mnt/train-data-5-hdd/yian/anacond/envs/mamma/bin/torchrun \
   --standalone --nproc_per_node=1 training/launch.py \
   --config mamma_smpl_embedding_memory
 ```
 
-Config 內本機 compose、checkpoint、SMPL-X 路徑需在其他機器上調整。目前預設 B=5、T=3、
-V=8、518px、20 queries。checkpoint 中原有權重可沿用；只有新 memory layers 和
-time embedding 缺少 checkpoint 權重屬正常。這只是初始化相容，並非新架構已訓練完成。
+每個 sample 現在只有 8 張影像，因此 `max_img_per_gpu: 40` 保留 B=5。
+若設成 8，則 B=1。原程式的 `accum_steps` 是將同一個 loader batch 切成多份反傳，
+不是跨多個 loader batches 累積；B=1 時不應設成 5。
 
-## Streaming 介面
+Trainer 正常化相機後呼叫 `prepare_gt_body_history`，傳給模型的參數為：
 
-```python
-memory = None  # 新 sequence / 新 batch 成員 / 視角或座標基準改變時重設
-with torch.no_grad():
-    output = model(
-        images=current_images,  # [B,V,3,H,W]
-        smpl_inputs={
-            "temporal_num_frames": torch.ones(B, device=device, dtype=torch.long),
-            "views_per_frame": torch.full((B,), V, device=device, dtype=torch.long),
-            "frame_ids": current_frame_ids.reshape(B, 1),
-            "smpl_memory": memory,
-        },
-    )
-memory = output["smpl_memory"]
-current_smpl = output["smpl_pose"]
+```text
+images                 [B,V,3,H,W]，只有當前影像
+history_body_pose      [B,2,P,66]，root 在當前 cam0 gauge
+history_body_beta      [B,2,P,10]
+history_root_position  [B,2,P,3]，pelvis 在當前 cam0 gauge
+history_valid          [B,2,P]
+history_frame_ids      [B,2]
+frame_ids              [B,1]
+temporal_num_frames    [B]，全部是 1
+views_per_frame        [B]
 ```
 
-推論先呼叫 `model.eval()`。歷史內容只有 spatial tokens、coarse translation、presence
-與 frame IDs，最多兩筆。需要固定視角順序與共同 cam0 gauge；當視角或 gauge 改變時
-應重設 memory。本 config 保持 `scale_by_extrinsics: false`，距離門檻依原資料尺度設定。
-既有使用 aggregator-token cache 的 inference scripts 不會自動切換到此介面。
+`model(images=images, smpl_inputs=...)` 回傳當前 `[B,20,...]` 預測。
+推論時仍需提供相同定義的兩幀歷史參數；此 config 是 GT-history 訓練/驗證。
+若實際部署改餵過去的模型預測，需另行訓練與評估預測歷史的誤差累積。
+沒有因為 checkpoint 可載入，就宣稱新 encoder 已訓練完成。
 
-## 可重現測試
+## 測試
 
 ```bash
 PYTHONPATH=.:training /mnt/train-data-5-hdd/yian/anacond/envs/mamma/bin/python \
-  -m unittest discover -s tests -p 'test_smpl_embedding_memory*.py' -v
+  -m unittest discover -s tests -p 'test_gt_body_history.py' -v
 
 CUDA_VISIBLE_DEVICES=2 PYTHONPATH=.:training \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 /mnt/train-data-5-hdd/yian/anacond/envs/mamma/bin/python \
-  debug/smoke_smpl_embedding_memory.py --steps 2
+  debug/smoke_gt_body_history.py
 ```
 
-Smoke test 從 `mamma_compose/harmony4d_train_1_NC_200_00_contact/be_HsuS3iLSSWWZ_seq_000090`
-載入真實三幀 clip，可用 `--compose-root` / `--sequence` 指定其他資料。
-它保留完整模型尺寸、8 views、518px、DPT mask 與所有配置 loss，載入 checkpoint，
-做 forward、loss、backward、gradient clipping、AdamW 更新，確認 temporal、spatial、
-camera、mask 都有有限且非零梯度。為了可重現，測試固定視角、關閉 color jitter、
-暫時不切 validation，並在同一個 batch 上執行指定次數；不代表訓練收斂或準確度評估。
+整合測試會對 MAMMA、Harmony4D 各取真實資料，使用完整 518px / 8 views / 20 queries / DPT
+架構，經實際 `Trainer._process_batch`、`Trainer._step` 計算 loss、backward、AdamW 更新。
+另檢查只讀當前 8 張 RGB、history encoder 梯度、當前 GT 不洩漏、GT-as-pred loss、
+current joints 重投影，及歷史 world 參數與轉換後 cam0 參數的 joints/vertices 幾何和投影一致性。
 
-測試報告與 resolved config 儲存在 `debug_outputs/smpl_embedding_memory_smoke/`。
-SMPL-X pickle 需要 `chumpy==0.70`，目前 body loader 已有 NumPy/Python 相容 shim。
-原 training optimizer 的參數匹配需要 `wcmatch`；本次測試在 mamma 環境補齊了這兩項依賴。
+GT oracle 重投影驗證的是座標/幾何路徑正確，不能當作未訓練 encoder 的預測準確度。
+報告及八視角 GT overlay 放在 `debug_outputs/gt_body_history_smoke/`。
 
-### 本機驗證結果（2026-09-15）
+### 實測結果（2026-09-16）
 
-- GPU 2：NVIDIA RTX PRO 6000 Blackwell；PyTorch 2.7.0+cu128。
-- 真實 frame IDs `[1,2,3]`，輸入 `[1,24,3,518,518]`。
-- SMPL 輸出 `[3,20,72]`，DPT mask 輸出 `[3,8,20,518,518]`。
-- 載入 checkpoint：只有新增的 33 個 memory/time state keys 缺失，沒有 unexpected keys。
-- 兩次 forward、全部 loss、backward、梯度裁切與 AdamW 更新通過。
-- 各步 objective 為 0.48497051、1.02731478；訓練模式包含 history dropout，
-  這兩個數值只用於證明計算有限，不能作為收斂或改善證據。
-- 各步 history valid 數量 `[0,2,4]`、`[0,1,4]`（每幀所有人的有效歷史筆數）。
-  最後一步的目標幀包含兩位人物、每人兩筆歷史。
-- GPU peak allocated 16.97、19.29 GiB；第二步包含已配置的 optimizer states。
-- Decoder、memory attention/gate、time embedding、camera、DPT mask 都有有限且非零梯度；
-  frozen aggregator 無梯度；time embedding 確實隨 optimizer step 更新。
-- 新架構 6 項與 loss 組合 2 項測試通過；原 temporal head / motion loss 11 項測試通過。
-- Trainer import 與新 config 的 optimizer 建構通過；所有 memory 參數均有被 optimizer 收錄。
+兩組來源各一個真實 sample，B=1、V=8、518px，載入 checkpoint_30，使用實際 Trainer
+preprocess / step 與全部配置 loss，forward / backward / clipping / AdamW 都通過。
+所有 encoder、fusion、spatial decoder、camera、mask 分支的梯度有限且非零，encoder
+權重更新成功。每個 sample 僅讀取 8 張當前影像；改變當前 GT 不影響傳入模型的歷史參數。
 
-完整量測保存在 `debug_outputs/smpl_embedding_memory_smoke/report.json`。
+| 項目 | MAMMA | Harmony4D |
+| --- | --- | --- |
+| Current GT joints 最大重投影誤差 | 0.000311 px | 0.000141 px |
+| History joints 最大投影差 | 0.000503 px | 0.000162 px |
+| History vertices 最大投影差 | 0.000696 px | 0.000195 px |
+| GT-as-pred joints2d loss | 2.46e-7 | 1.54e-7 |
+| GT-as-pred joints3d loss | 9.20e-8 | 7.43e-8 |
+| GT-as-pred translation / vertices loss | 0 / 0 | 0 / 0 |
+| 模型 objective | 0.567379 | 0.424437 |
+| GPU peak allocated | 9.44 GiB | 11.41 GiB |
+
+第二個來源沿用第一個 optimizer step 後的權重；objective 不用於資料集間的性能比較。
+以上接近零的重投影是 GT oracle 的幾何檢查，新 encoder 的模型預測仍需正式訓練。
+全套 26 項 unittest 通過，包括旋轉表示、有效性遮罩、歷史人物排列不變性、
+拒絕當前/未來作為歷史、encoder 梯度與既有 temporal/mask 測試。
