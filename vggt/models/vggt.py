@@ -15,6 +15,7 @@ from vggt.heads.camera_head import CameraHead
 from vggt.heads.dpt_head import DPTHead
 from vggt.heads.track_head import TrackHead
 from vggt.heads.smpl_head import SMPLHead
+from vggt.heads.smpl_embedding_memory_head import SMPLEmbeddingMemoryHead
 from vggt.heads.smpl_multi_query_head import SMPLMultiQueryHead
 from vggt.heads.smpl_multi_query_trans_head import SMPLMultiQueryTransHead
 from vggt.heads.smpl_multi_query_trans_rot_head import SMPLMultiQueryTransRotHead
@@ -37,6 +38,12 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_temporal_rel_pe=False,
                  temporal_rel_num_buckets=32, temporal_rel_max_distance=31,
                  temporal_head_max_T=128,
+                 temporal_mode="relative_image_context", temporal_memory_depth=2,
+                 temporal_detach_history=True, temporal_memory_dropout=0.1,
+                 temporal_memory_presence_threshold=0.3,
+                 temporal_memory_match_max_distance=2.0,
+                 temporal_memory_match_max_cost=1.5,
+                 temporal_memory_match_translation_weight=0.25,
                  enable_smpl_dense_landmark=False, enable_person_mask=False,
                  person_mask_head_type="dot", person_mask_down_ratio=2,
                  person_mask_embed_dim=None,
@@ -44,6 +51,11 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  landmark_detach_mask_context=True, landmark_predict_contact=False,
                  ):
         super().__init__()
+
+        if temporal_mode not in ("relative_image_context", "smpl_embedding_memory"):
+            raise ValueError(f"Unknown temporal_mode: {temporal_mode}")
+        if temporal_mode == "smpl_embedding_memory" and not enable_temporal_heads:
+            raise ValueError("smpl_embedding_memory requires enable_temporal_heads=True")
 
         if enable_temporal_heads and not enable_smpl_multi_query_trans_rot:
             raise ValueError(
@@ -64,6 +76,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, depth=depth, num_heads=num_heads, patch_embed=patch_embed, patch_embed_checkpoint=patch_embed_checkpoint)
         self.use_temporal_path_enabled = bool(enable_temporal_path)
         self.use_temporal_smpl_head = bool(enable_temporal_heads)
+        self.temporal_mode = temporal_mode
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1", out_channels=out_channels, intermediate_layer_idx=intermediate_layer_idx, frames_chunk_size=frames_chunk_size) if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1", out_channels=out_channels, intermediate_layer_idx=intermediate_layer_idx, frames_chunk_size=frames_chunk_size) if enable_depth else None
@@ -77,11 +90,25 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 rel_num_buckets=int(temporal_rel_num_buckets),
                 rel_max_distance=int(temporal_rel_max_distance),
             )
+            head_class = SMPLMultiQueryTransRotTemporalRelHead
+            memory_kwargs = {}
+            if temporal_mode == "smpl_embedding_memory":
+                head_class = SMPLEmbeddingMemoryHead
+                memory_kwargs = dict(
+                    memory_depth=temporal_memory_depth,
+                    detach_history=temporal_detach_history,
+                    memory_dropout=temporal_memory_dropout,
+                    presence_threshold=temporal_memory_presence_threshold,
+                    match_max_distance=temporal_memory_match_max_distance,
+                    match_max_cost=temporal_memory_match_max_cost,
+                    match_translation_weight=temporal_memory_match_translation_weight,
+                )
             self.smpl_multi_query_trans_rot_head = (
-                SMPLMultiQueryTransRotTemporalRelHead(
+                head_class(
                     dim_in=2 * embed_dim,
                     num_people=smpl_num_people,
                     smpl_cfg=temporal_cfg,
+                    **memory_kwargs,
                 )
             )
         else:

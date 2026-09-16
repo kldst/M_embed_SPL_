@@ -1,0 +1,120 @@
+# Causal current-image + two-frame spatial SMPL embedding memory.
+# Inherits the existing 518px / eight-view / SMPL-X / DPT loss setup.
+defaults:
+  - mamma_harmony4d_mask_dpt
+  - _self_
+
+exp_name: mamma_smpl_embedding_memory_2frame
+mamma_compose_root: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/mamma_compose
+harmony4d_compose_root: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/mamma_harmony4d_compose
+# Each sample contains T*V=24 images. A budget of 120 therefore requests B=5.
+max_img_per_gpu: 120
+
+temporal_training:
+  clip_length: 3
+  clip_stride: 1
+
+data:
+  train:
+    common_config:
+      max_img_per_gpu: ${max_img_per_gpu}
+    dataset:
+      dataset_configs:
+        - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
+          split: train
+          SysSMPL_DIR: ${mamma_compose_root}
+          SysSMPL_ANNOTATION_DIR: ${mamma_compose_root}
+          compose_cache_root: ${mamma_compose_root}
+          prefer_compose_cache: true
+          require_complete_compose_cache: false
+          max_num_people: 6
+          min_num_images: 8
+          emit_landmarks: false
+          emit_contact: false
+          emit_person_mask: true
+          person_mask_stride: 1
+          # MAMMA contributes all usable sequences to training. Validation is
+          # taken from Harmony4D below, matching the parent experiment.
+          val_sequence_fraction: 0.0
+          split_seed: ${split_seed}
+          max_sequences: ${debug_max_sequences}
+          max_frames_per_sequence: ${debug_max_frames_per_sequence}
+        - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
+          split: train
+          SysSMPL_DIR: ${harmony4d_compose_root}
+          SysSMPL_ANNOTATION_DIR: ${harmony4d_compose_root}
+          compose_cache_root: ${harmony4d_compose_root}
+          prefer_compose_cache: true
+          require_complete_compose_cache: true
+          max_num_people: 6
+          min_num_images: 8
+          emit_landmarks: false
+          emit_contact: false
+          emit_person_mask: true
+          person_mask_stride: 1
+          val_sequence_fraction: ${val_sequence_fraction}
+          split_seed: ${split_seed}
+          max_sequences: ${debug_max_sequences}
+          max_frames_per_sequence: ${debug_max_frames_per_sequence}
+  val:
+    dataset:
+      dataset_configs:
+        - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
+          split: val
+          SysSMPL_DIR: ${harmony4d_compose_root}
+          SysSMPL_ANNOTATION_DIR: ${harmony4d_compose_root}
+          compose_cache_root: ${harmony4d_compose_root}
+          prefer_compose_cache: true
+          require_complete_compose_cache: true
+          max_num_people: 6
+          min_num_images: 8
+          emit_landmarks: false
+          emit_contact: false
+          emit_person_mask: true
+          person_mask_stride: 1
+          val_sequence_fraction: ${val_sequence_fraction}
+          split_seed: ${split_seed}
+          max_sequences: ${debug_val_max_sequences}
+          max_frames_per_sequence: ${debug_val_max_frames_per_sequence}
+
+model:
+  temporal_mode: smpl_embedding_memory
+  temporal_memory_depth: 2
+  temporal_detach_history: true
+  temporal_memory_dropout: 0.1
+  temporal_memory_presence_threshold: 0.3
+  # Translation distances are in the common cam0 gauge, without baseline scaling.
+  temporal_memory_match_max_distance: 2.0
+  temporal_memory_match_max_cost: 1.5
+  temporal_memory_match_translation_weight: 0.25
+
+loss:
+  _target_: training.loss_smpl_embedding_memory.SMPLEmbeddingMemoryLoss
+  smplx_model_dir: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/smplx_models
+  spatial_aux_weight: 0.25
+
+checkpoint:
+  resume_checkpoint_path: /mnt/train-data-4-hdd/yian/Multi_SMPL/yian/model/checkpoint_30.pt
+  strict: false
+  load_model_only: true
+  # Existing checkpoint already contains the trained DPT mask head.
+  init_mask_trunk_from_depth: false
+
+logging:
+  use_wandb: false
+  scalar_keys_to_log:
+    train:
+      keys_to_log:
+        - loss_objective
+        - loss_camera
+        - loss_smpl
+        - loss_smpl_spatial_aux
+        - loss_smpl_temporal_pose
+        - loss_smpl_temporal_beta
+        - loss_smpl_temporal_mesh_translate
+        - loss_smpl_temporal_root_rotation
+        - loss_mask
+        - mask_soft_iou
+        - smpl_memory_valid_fraction
+    val:
+      keys_to_log: ${logging.scalar_keys_to_log.train.keys_to_log}
